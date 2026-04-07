@@ -1,0 +1,211 @@
+name: Build & Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (auto = auto-increment patch, or specify like 1.0.0)'
+        required: false
+        default: 'auto'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-deploy
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Tag push → use the tag verbatim
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+            VERSION="${TAG#v}"
+            echo "📦 Tag push detected: v${VERSION}"
+            echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          INPUT_VERSION="${{ github.event.inputs.version }}"
+          INPUT_VERSION="${INPUT_VERSION#v}"
+
+          if echo "$INPUT_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "📦 Using explicit version: v${INPUT_VERSION}"
+            echo "VERSION=${INPUT_VERSION}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "🔍 Auto-detecting latest release and incrementing patch..."
+          LATEST=$(gh release list --repo "${{ github.repository }}" --limit 100 --json tagName --jq '.[].tagName' \
+            | sed 's/^v//' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -t. -k1,1n -k2,2n -k3,3n \
+            | tail -1 || true)
+
+          if [ -z "$LATEST" ]; then
+            PKG_VERSION=$(jq -r .version package.json)
+            NEW_VERSION="${PKG_VERSION:-0.1.0}"
+            echo "📦 No existing releases → starting at v${NEW_VERSION} (from package.json)"
+          else
+            MAJOR=$(echo "$LATEST" | cut -d. -f1)
+            MINOR=$(echo "$LATEST" | cut -d. -f2)
+            PATCH=$(echo "$LATEST" | cut -d. -f3)
+            NEW_PATCH=$((PATCH + 1))
+            NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+            echo "📦 Latest: v${LATEST} → New: v${NEW_VERSION}"
+          fi
+
+          echo "VERSION=${NEW_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2.0.1
+        with:
+          bun-version: 1.3.11
+
+      # ========== BUILD PHASE ==========
+      - name: Install dependencies
+        run: |
+          echo "📦 Installing dependencies..."
+          bun install --frozen-lockfile
+
+      - name: Build CLI
+        run: |
+          echo "🔨 Building openclaude CLI..."
+          bun run build
+          if [ ! -f dist/cli.mjs ]; then
+            echo "❌ Build completed but dist/cli.mjs is missing"
+            ls -lh dist/ || true
+            exit 1
+          fi
+          echo "✅ Build artifact: $(du -h dist/cli.mjs | cut -f1)"
+
+      - name: Smoke test
+        run: |
+          echo "💨 Running smoke test..."
+          node dist/cli.mjs --version
+
+      # ========== PACK PHASE ==========
+      - name: Create release archive
+        id: pack
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          PACK_DIR="pack-output"
+          ARCHIVE_NAME="openclaude-v${VERSION}.zip"
+
+          echo "📁 Staging release contents..."
+          mkdir -p "$PACK_DIR"
+          cp dist/cli.mjs "$PACK_DIR/"
+          cp -r bin "$PACK_DIR/"
+          cp README.md LICENSE "$PACK_DIR/" 2>/dev/null || true
+
+          BUILD_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          jq -n \
+            --arg version "$VERSION" \
+            --arg sha "${{ github.sha }}" \
+            --arg time "$BUILD_TIME" \
+            '{
+              name: "openclaude",
+              version: $version,
+              entry: "cli.mjs",
+              build: {
+                git_sha: $sha,
+                built_at: $time,
+                runtime: "bun",
+                bun_version: "1.3.11"
+              }
+            }' > "$PACK_DIR/build.json"
+
+          (cd "$PACK_DIR" && zip -r "../$ARCHIVE_NAME" .)
+          sha256sum "$ARCHIVE_NAME" > "${ARCHIVE_NAME}.sha256"
+
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+          echo "📦 Created: $ARCHIVE_NAME ($(du -h "$ARCHIVE_NAME" | cut -f1))"
+
+      # ========== RELEASE PHASE ==========
+      - name: Delete existing release (if redeploying same version)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          gh release delete "v${VERSION}" \
+            --repo "${{ github.repository }}" \
+            --yes --cleanup-tag || true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          gh release create "v${VERSION}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "openclaude v${VERSION}" \
+            --notes "$(cat <<EOF
+          ## openclaude v${VERSION}
+
+          Automated build & release.
+
+          ### Build info
+          - Git SHA: \`${{ github.sha }}\`
+          - Runtime: Bun 1.3.11 / Node 22
+          - Built: $(date -u +"%Y-%m-%d %H:%M UTC")
+
+          ### Install
+          \`\`\`
+          unzip ${{ env.ARCHIVE_NAME }}
+          node cli.mjs --version
+          \`\`\`
+          EOF
+          )" \
+            "${{ env.ARCHIVE_NAME }}" \
+            "${{ env.ARCHIVE_NAME }}.sha256"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: openclaude-v${{ steps.version.outputs.VERSION }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+            pack-output/build.json
+          retention-days: 14
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          echo "## 🚀 openclaude Build & Deploy" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | v${VERSION} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Archive | ${{ env.ARCHIVE_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Git SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Release | [v${VERSION}](https://github.com/${{ github.repository }}/releases/tag/v${VERSION}) |" >> $GITHUB_STEP_SUMMARY
